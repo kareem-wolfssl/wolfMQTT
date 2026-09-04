@@ -1732,6 +1732,22 @@ static int BrokerClient_WriteDirect(BrokerClient* bc, int packet_len)
     return rc;
 }
 
+/* Write a direct response and normalize the result for the dispatch loop:
+ * packet_len once the whole frame is out, MQTT_CODE_CONTINUE while the
+ * transport is still draining it (resumed by BrokerClient_ResumeDirect), and
+ * MQTT_CODE_ERROR_NETWORK for anything else. Collapsing every incomplete
+ * write to one code lets BrokerRcIsFatal close the connection, which is what
+ * [MQTT-3.1.2-8] requires so the Will is published. */
+static int BrokerClient_WriteResp(BrokerClient* bc, int packet_len)
+{
+    int rc = BrokerClient_WriteDirect(bc, packet_len);
+
+    if (rc == packet_len || rc == MQTT_CODE_CONTINUE) {
+        return rc;
+    }
+    return MQTT_CODE_ERROR_NETWORK;
+}
+
 #ifndef WOLFMQTT_STATIC_MEMORY
 /* -------------------------------------------------------------------------- */
 /* Per-subscriber outbound publish queue (dynamic memory only).
@@ -5972,13 +5988,22 @@ static int BrokerTopicMatch(const char* filter, const char* topic)
 /* -------------------------------------------------------------------------- */
 static int BrokerSend_PingResp(BrokerClient* bc)
 {
+    int rc;
+
     if (bc == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
     WBLOG_DBG(bc->broker, "broker: PINGREQ -> PINGRESP sock=%d", (int)bc->sock);
     bc->tx_buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_PING_RESP);
     bc->tx_buf[1] = 0;
-    return BrokerClient_WriteDirect(bc, 2);
+    rc = BrokerClient_WriteDirect(bc, 2);
+    if (rc == 2) {
+        rc = MQTT_CODE_SUCCESS;
+    }
+    else if (rc >= 0) {
+        rc = MQTT_CODE_ERROR_NETWORK;
+    }
+    return rc;
 }
 
 int BrokerSend_SubAck(BrokerClient* bc, word16 packet_id,
@@ -6035,7 +6060,7 @@ int BrokerSend_SubAck(BrokerClient* bc, word16 packet_id,
         bc->tx_buf[pos++] = return_codes[i];
     }
 
-    return BrokerClient_WriteDirect(bc, pos);
+    return BrokerClient_WriteResp(bc, pos);
 }
 
 #ifdef WOLFMQTT_V5
@@ -7273,7 +7298,7 @@ static int BrokerHandle_Unsubscribe(BrokerClient* bc, int rx_len,
     if (rc > 0) {
         WBLOG_INFO(broker, "broker: UNSUBACK send sock=%d packet_id=%u",
             (int)bc->sock, ack.packet_id);
-        rc = BrokerClient_WriteDirect(bc, rc);
+        rc = BrokerClient_WriteResp(bc, rc);
     }
 
 #ifdef WOLFMQTT_BROKER_PERSIST
@@ -7829,7 +7854,7 @@ static int BrokerHandle_Publish(BrokerClient* bc, int rx_len,
         if (rc > 0) {
             WBLOG_DBG(broker, "broker: PUBRESP send sock=%d qos=%d packet_id=%u",
                 (int)bc->sock, pub.qos, pub.packet_id);
-            rc = BrokerClient_WriteDirect(bc, rc);
+            rc = BrokerClient_WriteResp(bc, rc);
         }
     }
 
@@ -7891,7 +7916,7 @@ static int BrokerHandle_PublishRel(BrokerClient* bc, int rx_len)
     if (rc > 0) {
         WBLOG_DBG(bc->broker, "broker: PUBCOMP send sock=%d packet_id=%u",
             (int)bc->sock, resp.packet_id);
-        rc = BrokerClient_WriteDirect(bc, rc);
+        rc = BrokerClient_WriteResp(bc, rc);
     }
     return rc;
 }
@@ -7959,7 +7984,7 @@ static int BrokerHandle_PublishRec(BrokerClient* bc, int rx_len)
 #endif
         WBLOG_DBG(bc->broker, "broker: PUBREL send sock=%d packet_id=%u",
             (int)bc->sock, resp.packet_id);
-        rc = BrokerClient_WriteDirect(bc, rc);
+        rc = BrokerClient_WriteResp(bc, rc);
 #ifdef WOLFMQTT_STATIC_MEMORY
         if (tracked && rc == enc_len) {
             BrokerStaticOrphan_PubRelWritten(bc->broker, bc,
@@ -8000,10 +8025,17 @@ static void BrokerClient_AbnormalClose(MqttBroker* broker, BrokerClient* bc)
  *   - Server-side resource exhaustion (allocator failure, per-client cap
  *     reached) - the connection must be torn down so resources release.
  *   - v5 property protocol errors (too many properties, duplicate singleton)
- *     are malformed packets [MQTT-4.13.1]; the client must be disconnected. */
+ *     are malformed packets [MQTT-4.13.1]; the client must be disconnected.
+ *   - A direct response that could not be written (BrokerClient_WriteResp).
+ *     [MQTT-3.1.2-8] requires the Will when the connection drops without a
+ *     DISCONNECT, and a server-detected I/O error is such a drop; the socket
+ *     is dead either way, so continuing to serve the client is not an
+ *     option. Handlers only report this for their own client's response
+ *     write - fan-out failures are handled against the subscriber. */
 static int BrokerRcIsFatal(int rc)
 {
-    return (rc == MQTT_CODE_ERROR_MALFORMED_DATA ||
+    return (rc == MQTT_CODE_ERROR_NETWORK ||
+            rc == MQTT_CODE_ERROR_MALFORMED_DATA ||
             rc == MQTT_CODE_ERROR_PACKET_TYPE ||
             rc == MQTT_CODE_ERROR_PACKET_ID ||
             rc == MQTT_CODE_ERROR_PROPERTY ||
@@ -8384,7 +8416,16 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                     BrokerClient_AbnormalClose(broker, bc);
                     return 0;
                 }
-                (void)BrokerSend_PingResp(bc);
+                /* A failed PINGRESP write is an I/O error like any other
+                 * direct response: close so the Will is published. */
+                rc = BrokerSend_PingResp(bc);
+                if (rc != MQTT_CODE_SUCCESS && rc != MQTT_CODE_CONTINUE) {
+                    WBLOG_ERR(broker,
+                        "broker: PINGRESP write failed sock=%d rc=%d",
+                        (int)bc->sock, rc);
+                    BrokerClient_AbnormalClose(broker, bc);
+                    return 0;
+                }
                 break;
             case MQTT_PACKET_TYPE_DISCONNECT:
                 /* MQTT 3.1.1 section 3.14: DISCONNECT has no variable header and
