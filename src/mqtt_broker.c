@@ -1733,11 +1733,15 @@ static int BrokerClient_WriteDirect(BrokerClient* bc, int packet_len)
 }
 
 /* Write a direct response and normalize the result for the dispatch loop:
- * packet_len once the whole frame is out, MQTT_CODE_CONTINUE while the
- * transport is still draining it (resumed by BrokerClient_ResumeDirect), and
- * MQTT_CODE_ERROR_NETWORK for anything else. Collapsing every incomplete
- * write to one code lets BrokerRcIsFatal close the connection, which is what
- * [MQTT-3.1.2-8] requires so the Will is published. */
+ *   packet_len            - the whole frame is out.
+ *   MQTT_CODE_CONTINUE    - a deferral, not a failure: the transport is still
+ *                           draining the frame and BrokerClient_ResumeDirect
+ *                           finishes it, so it is passed through untouched.
+ *   MQTT_CODE_ERROR_NETWORK - the write failed, or stopped short with no way
+ *                           to resume.
+ * Mapping every result that cannot be resumed onto one code lets
+ * BrokerRcIsFatal close the connection, which is what [MQTT-3.1.2-8] requires
+ * so the Will is published. */
 static int BrokerClient_WriteResp(BrokerClient* bc, int packet_len)
 {
     int rc = BrokerClient_WriteDirect(bc, packet_len);
@@ -5988,22 +5992,13 @@ static int BrokerTopicMatch(const char* filter, const char* topic)
 /* -------------------------------------------------------------------------- */
 static int BrokerSend_PingResp(BrokerClient* bc)
 {
-    int rc;
-
     if (bc == NULL) {
         return MQTT_CODE_ERROR_BAD_ARG;
     }
     WBLOG_DBG(bc->broker, "broker: PINGREQ -> PINGRESP sock=%d", (int)bc->sock);
     bc->tx_buf[0] = MQTT_PACKET_TYPE_SET(MQTT_PACKET_TYPE_PING_RESP);
     bc->tx_buf[1] = 0;
-    rc = BrokerClient_WriteDirect(bc, 2);
-    if (rc == 2) {
-        rc = MQTT_CODE_SUCCESS;
-    }
-    else if (rc >= 0) {
-        rc = MQTT_CODE_ERROR_NETWORK;
-    }
-    return rc;
+    return BrokerClient_WriteResp(bc, 2);
 }
 
 int BrokerSend_SubAck(BrokerClient* bc, word16 packet_id,
@@ -8419,7 +8414,7 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
                 /* A failed PINGRESP write is an I/O error like any other
                  * direct response: close so the Will is published. */
                 rc = BrokerSend_PingResp(bc);
-                if (rc != MQTT_CODE_SUCCESS && rc != MQTT_CODE_CONTINUE) {
+                if (BrokerRcIsFatal(rc)) {
                     WBLOG_ERR(broker,
                         "broker: PINGRESP write failed sock=%d rc=%d",
                         (int)bc->sock, rc);
